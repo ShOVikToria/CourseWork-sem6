@@ -14,33 +14,41 @@ namespace PictureSearch
 
         private Mat _templateDescriptor;
         private KeyPoint[] _templateKeypoints;
-        private double _magnification = 1.0; // Змінна для зберігання масштабу "лупи"
+        private double _magnification = 1.0;
+        private int _templateWidth;
+        private int _templateHeight;
 
         public void AnalyzeTemplate(Bitmap croppedTemplate)
         {
-            TargetClass = "Пошук об'єктів (ORB + CLAHE + Magnifier)...";
+            if (croppedTemplate == null) return;
 
-            // ЦИФРОВА ЛУПА: Якщо картинка занадто мала, вираховуємо коефіцієнт збільшення
+            TargetClass = "Пошук (Максимальна точність ORB)...";
+
             _magnification = 1.0;
             int minSide = Math.Min(croppedTemplate.Width, croppedTemplate.Height);
+
             if (minSide < 100 && minSide > 0)
             {
-                _magnification = 100.0 / minSide; // Наприклад, 40px збільшиться у 2.5 рази
+                _magnification = 100.0 / minSide;
             }
 
             using var tempMat = BitmapConverter.ToMat(croppedTemplate);
             using var grayTemplate = new Mat();
             Cv2.CvtColor(tempMat, grayTemplate, ColorConversionCodes.BGR2GRAY);
 
-            // Застосовуємо збільшення до еталону
             using var magnifiedTemplate = new Mat();
             Cv2.Resize(grayTemplate, magnifiedTemplate, new OpenCvSharp.Size(0, 0), _magnification, _magnification, InterpolationFlags.Cubic);
 
+            _templateWidth = magnifiedTemplate.Width;
+            _templateHeight = magnifiedTemplate.Height;
+
             using var enhancedTemplate = new Mat();
-            using var clahe = Cv2.CreateCLAHE(clipLimit: 2.0, tileGridSize: new OpenCvSharp.Size(8, 8));
+            // ЗМІНЕНО: Підвищили контрастність еталону (clipLimit з 2.0 до 3.0)
+            using var clahe = Cv2.CreateCLAHE(clipLimit: 3.0, tileGridSize: new OpenCvSharp.Size(8, 8));
             clahe.Apply(magnifiedTemplate, enhancedTemplate);
 
-            using var orb = ORB.Create(5000, 1.2f, 8, 15, 0, 2, 0, 15, 10);
+            // ЗМІНЕНО: Робимо еталон гіперчутливим до найменших тіней (fastThreshold: 5)
+            using var orb = ORB.Create(5000, 1.2f, 8, 15, 0, 2, 0, 15, 5);
             _templateDescriptor = new Mat();
             orb.DetectAndCompute(enhancedTemplate, null, out _templateKeypoints, _templateDescriptor);
         }
@@ -49,6 +57,16 @@ namespace PictureSearch
         {
             List<string> matchedFiles = new List<string>();
             int total = collectionPaths.Count;
+
+            if (_templateKeypoints == null || _templateKeypoints.Length < 4)
+                return matchedFiles;
+
+            bool isSmallTemplate = _templateKeypoints.Length < 150;
+
+            // ЗМІНЕНО: Дозволяємо ловити об'єкт навіть за 5 хорошими точками
+            int minRequiredInliers = isSmallTemplate ? 5 : 15;
+            float ratioTestThreshold = isSmallTemplate ? 0.85f : 0.75f;
+            double requiredInlierRatio = isSmallTemplate ? 0.03 : 0.12;
 
             using var matcher = new BFMatcher(NormTypes.Hamming, crossCheck: false);
             using var clahe = Cv2.CreateCLAHE(clipLimit: 2.0, tileGridSize: new OpenCvSharp.Size(8, 8));
@@ -60,14 +78,14 @@ namespace PictureSearch
                     using var targetImg = Cv2.ImRead(collectionPaths[i], ImreadModes.Grayscale);
                     if (targetImg.Empty()) continue;
 
-                    // Застосовуємо ТАКЕ САМЕ збільшення до фото з колекції
                     using var magnifiedTarget = new Mat();
                     Cv2.Resize(targetImg, magnifiedTarget, new OpenCvSharp.Size(0, 0), _magnification, _magnification, InterpolationFlags.Cubic);
 
                     using var enhancedTarget = new Mat();
                     clahe.Apply(magnifiedTarget, enhancedTarget);
 
-                    using var orb = ORB.Create(5000, 1.2f, 8, 15, 0, 2, 0, 15, 10);
+                    // ЗМІНЕНО: Даємо колекції ліміт у 20 000 точок, щоб дрібні деталі не губилися!
+                    using var orb = ORB.Create(20000, 1.2f, 8, 15, 0, 2, 0, 15, 7);
                     using var targetDescriptor = new Mat();
                     orb.DetectAndCompute(enhancedTarget, null, out var targetKeypoints, targetDescriptor);
 
@@ -75,44 +93,62 @@ namespace PictureSearch
 
                     var matches = matcher.KnnMatch(_templateDescriptor, targetDescriptor, k: 2);
                     var goodMatches = new List<DMatch>();
+
                     foreach (var m in matches)
                     {
-                        if (m.Length > 1 && m[0].Distance < 0.75f * m[1].Distance)
-                        {
+                        if (m.Length > 1 && m[0].Distance < ratioTestThreshold * m[1].Distance)
                             goodMatches.Add(m[0]);
-                        }
                     }
 
-                    if (goodMatches.Count >= 15)
+                    if (goodMatches.Count >= minRequiredInliers)
                     {
                         var srcPts = goodMatches.Select(m => _templateKeypoints[m.QueryIdx].Pt).Select(p => new Point2d(p.X, p.Y)).ToArray();
                         var dstPts = goodMatches.Select(m => targetKeypoints[m.TrainIdx].Pt).Select(p => new Point2d(p.X, p.Y)).ToArray();
 
                         using var mask = new Mat();
-                        var homography = Cv2.FindHomography(InputArray.Create(srcPts), InputArray.Create(dstPts), HomographyMethods.Ransac, 3.0, mask);
+                        // ЗМІНЕНО: Послаблюємо RANSAC для малих об'єктів (5.0 замість 3.0), бо малі деталі можуть трохи "з'їжджати"
+                        double ransacError = isSmallTemplate ? 5.0 : 3.0;
+                        var homography = Cv2.FindHomography(InputArray.Create(srcPts), InputArray.Create(dstPts), HomographyMethods.Ransac, ransacError, mask);
 
                         if (!homography.Empty())
                         {
-                            int inliersCount = 0;
-                            byte[] maskBytes = new byte[mask.Rows * mask.Cols];
-                            System.Runtime.InteropServices.Marshal.Copy(mask.Data, maskBytes, 0, maskBytes.Length);
+                            var objCorners = new Point2d[] {
+                                new Point2d(0, 0),
+                                new Point2d(_templateWidth, 0),
+                                new Point2d(_templateWidth, _templateHeight),
+                                new Point2d(0, _templateHeight)
+                            };
 
-                            foreach (var b in maskBytes)
+                            var sceneCorners = Cv2.PerspectiveTransform(objCorners, homography);
+                            var pointsForConvex = sceneCorners.Select(p => new OpenCvSharp.Point((int)p.X, (int)p.Y)).ToList();
+
+                            // ЗМІНЕНО: Геометрична перевірка тепер гнучка!
+                            // Для малих ділянок ми вимикаємо перевірку на "перекручування", бо матриця перспективи на 5 точках завжди трохи ламається
+                            bool isConvex = Cv2.IsContourConvex(pointsForConvex);
+                            bool geometryPassed = isSmallTemplate ? true : isConvex;
+
+                            // Площа все одно не повинна бути мікроскопічною (мінімум 2% від еталону)
+                            double area = Cv2.ContourArea(pointsForConvex);
+                            bool isAreaValid = area > (_templateWidth * _templateHeight * 0.02);
+
+                            if (geometryPassed && isAreaValid)
                             {
-                                if (b > 0) inliersCount++;
-                            }
+                                int inliersCount = 0;
+                                byte[] maskBytes = new byte[mask.Rows * mask.Cols];
+                                System.Runtime.InteropServices.Marshal.Copy(mask.Data, maskBytes, 0, maskBytes.Length);
 
-                            // НОВЕ: Рахуємо "Відсоток достовірності" (Inlier Ratio)
-                            // Ділимо кількість ідеальних точок на кількість усіх хороших збігів
-                            double inlierRatio = (double)inliersCount / goodMatches.Count;
-
-                            // Якщо маємо мінімум 15 ІДЕАЛЬНИХ збігів...
-                            if (inliersCount >= 15)
-                            {
-                                // ...І ці збіги становлять хоча б 12% від усіх знайдених (відсіюємо море і хаос)
-                                if (inlierRatio >= 0.12)
+                                foreach (var b in maskBytes)
                                 {
-                                    matchedFiles.Add(collectionPaths[i]);
+                                    if (b > 0) inliersCount++;
+                                }
+
+                                if (inliersCount >= minRequiredInliers)
+                                {
+                                    double inlierRatio = (double)inliersCount / goodMatches.Count;
+                                    if (inlierRatio >= requiredInlierRatio)
+                                    {
+                                        matchedFiles.Add(collectionPaths[i]);
+                                    }
                                 }
                             }
                         }

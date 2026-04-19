@@ -132,13 +132,18 @@ namespace PictureSearch
                 {
                     picTemplate.Image = Image.FromFile(ofd.FileName);
 
-                    // Замість порожнього прямокутника, одразу виділяємо майже все фото, залишаючи невеликі відступи
                     int margin = 20;
+                    // Створюємо початкову рамку
                     selectionRect = new Rectangle(margin, margin, picTemplate.Width - (margin * 2), picTemplate.Height - (margin * 2));
 
-                    referenceCrop = null;
-                    lblStatus.Text = "Налаштуйте рамку та натисніть двічі (або відпустіть), щоб підтвердити.";
-                    picTemplate.Invalidate(); // Перемальовуємо
+                    // НОВЕ: Автоматично вирізаємо еталон одразу при завантаженні!
+                    referenceCrop = CropImage(picTemplate.Image, selectionRect);
+
+                    lblStatus.Text = "Еталон завантажено! Можете змінити рамку або почати пошук.";
+                    picTemplate.Invalidate();
+
+                    // НОВЕ: Оновлюємо стан кнопки (вона увімкнеться)
+                    CheckReadyToSearch();
                 }
             }
         }
@@ -265,28 +270,43 @@ namespace PictureSearch
         {
             using (FolderBrowserDialog fbd = new FolderBrowserDialog())
             {
+                fbd.Description = "Виберіть головну папку (включно з усіма підпапками)";
+
                 if (fbd.ShowDialog() == DialogResult.OK)
                 {
                     collectionPaths.Clear();
                     listCollection.Items.Clear();
                     imageListCollection.Images.Clear();
 
-                    string[] files = Directory.GetFiles(fbd.SelectedPath, "*.*");
-                    foreach (string file in files)
+                    // Показуємо користувачеві, що програма не зависла
+                    lblStatus.Text = "Сканування папок...";
+                    Application.DoEvents(); // Оновлюємо інтерфейс миттєво
+
+                    // Викликаємо наш новий "розумний" метод
+                    collectionPaths = GetImagesRecursively(fbd.SelectedPath);
+
+                    lblStatus.Text = $"Створення мініатюр для {collectionPaths.Count} фото...";
+                    Application.DoEvents();
+
+                    foreach (string file in collectionPaths)
                     {
-                        if (file.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) || file.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
+                        try
                         {
-                            collectionPaths.Add(file);
-                            // Використовуємо using для негайного очищення пам'яті від оригіналу
                             using (Image originalImg = Image.FromFile(file))
                             {
                                 Image thumb = originalImg.GetThumbnailImage(80, 80, () => false, IntPtr.Zero);
                                 imageListCollection.Images.Add(file, thumb);
                             }
+                            // Додаємо в список. Text - це лише ім'я файлу, а Tag - повний шлях
                             listCollection.Items.Add(new ListViewItem { ImageKey = file, Text = Path.GetFileName(file), Tag = file });
                         }
+                        catch
+                        {
+                            // Якщо трапився якийсь "битий" файл зображення - просто пропускаємо його
+                        }
                     }
-                    lblStatus.Text = $"Завантажено {collectionPaths.Count} фото.";
+
+                    lblStatus.Text = $"Завантажено {collectionPaths.Count} фото з усіх підпапок.";
                     CheckReadyToSearch();
                 }
             }
@@ -309,6 +329,12 @@ namespace PictureSearch
 
         private async void BtnSearch_Click(object sender, EventArgs e)
         {
+            if (referenceCrop == null)
+            {
+                MessageBox.Show("Помилка: Еталон не виділено!", "Увага", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
             btnSearch.Enabled = false;
             listResults.Items.Clear();
             imageListResults.Images.Clear();
@@ -356,6 +382,40 @@ namespace PictureSearch
             btnSearch.Enabled = false;
             progressBar.Value = 0;
             lblStatus.Text = "Скинуто.";
+        }
+
+        private List<string> GetImagesRecursively(string path)
+        {
+            List<string> files = new List<string>();
+            try
+            {
+                // 1. Спочатку збираємо всі картинки у поточній папці
+                string[] extensions = { ".jpg", ".jpeg", ".png" };
+                foreach (string file in Directory.GetFiles(path))
+                {
+                    if (extensions.Any(ext => file.EndsWith(ext, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        files.Add(file);
+                    }
+                }
+
+                // 2. Тепер знаходимо всі папки всередині цієї папки...
+                // ...і для кожної з них знову викликаємо цей самий метод! (Рекурсія)
+                foreach (string directory in Directory.GetDirectories(path))
+                {
+                    files.AddRange(GetImagesRecursively(directory));
+                }
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // Якщо Windows не пускає в якусь системну підпапку - просто ігноруємо її і йдемо далі
+            }
+            catch (Exception)
+            {
+                // Ігноруємо інші можливі помилки читання диска
+            }
+
+            return files;
         }
     }
 }
