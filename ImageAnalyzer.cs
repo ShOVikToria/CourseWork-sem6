@@ -14,34 +14,34 @@ namespace PictureSearch
 
         private Mat _templateDescriptor;
         private KeyPoint[] _templateKeypoints;
+        private double _magnification = 1.0; // Змінна для зберігання масштабу "лупи"
 
         public void AnalyzeTemplate(Bitmap croppedTemplate)
         {
-            TargetClass = "Пошук об'єктів (ORB + CLAHE)...";
+            TargetClass = "Пошук об'єктів (ORB + CLAHE + Magnifier)...";
+
+            // ЦИФРОВА ЛУПА: Якщо картинка занадто мала, вираховуємо коефіцієнт збільшення
+            _magnification = 1.0;
+            int minSide = Math.Min(croppedTemplate.Width, croppedTemplate.Height);
+            if (minSide < 100 && minSide > 0)
+            {
+                _magnification = 100.0 / minSide; // Наприклад, 40px збільшиться у 2.5 рази
+            }
 
             using var tempMat = BitmapConverter.ToMat(croppedTemplate);
             using var grayTemplate = new Mat();
             Cv2.CvtColor(tempMat, grayTemplate, ColorConversionCodes.BGR2GRAY);
 
-            // ПОКРАЩЕННЯ 1: Підвищуємо контраст, щоб знаходити точки на гладких поверхнях
+            // Застосовуємо збільшення до еталону
+            using var magnifiedTemplate = new Mat();
+            Cv2.Resize(grayTemplate, magnifiedTemplate, new OpenCvSharp.Size(0, 0), _magnification, _magnification, InterpolationFlags.Cubic);
+
             using var enhancedTemplate = new Mat();
             using var clahe = Cv2.CreateCLAHE(clipLimit: 2.0, tileGridSize: new OpenCvSharp.Size(8, 8));
-            clahe.Apply(grayTemplate, enhancedTemplate);
+            clahe.Apply(magnifiedTemplate, enhancedTemplate);
 
-            // Робимо алгоритм гіперчутливим для гладких поверхонь та маленьких фрагментів
-            using var orb = ORB.Create(
-                5000,   // 1. Кількість точок
-                1.2f,   // 2. ScaleFactor 
-                8,      // 3. NLevels 
-                15,     // 4. EdgeThreshold (пускаємо ближче до країв)
-                0,      // 5. FirstLevel 
-                2,      // 6. WTA_K 
-                0,      // 7. ScoreType (Магія C#! Передаємо 0 замість назви)
-                15,     // 8. PatchSize (зменшуємо візерунок)
-                10       // 9. FastThreshold (ГОЛОВНЕ: гіперчутливість до дрібних тіней на мордочці)
-            );
+            using var orb = ORB.Create(5000, 1.2f, 8, 15, 0, 2, 0, 15, 10);
             _templateDescriptor = new Mat();
-
             orb.DetectAndCompute(enhancedTemplate, null, out _templateKeypoints, _templateDescriptor);
         }
 
@@ -51,7 +51,6 @@ namespace PictureSearch
             int total = collectionPaths.Count;
 
             using var matcher = new BFMatcher(NormTypes.Hamming, crossCheck: false);
-            // Створюємо CLAHE один раз для всіх фото колекції
             using var clahe = Cv2.CreateCLAHE(clipLimit: 2.0, tileGridSize: new OpenCvSharp.Size(8, 8));
 
             for (int i = 0; i < total; i++)
@@ -61,28 +60,20 @@ namespace PictureSearch
                     using var targetImg = Cv2.ImRead(collectionPaths[i], ImreadModes.Grayscale);
                     if (targetImg.Empty()) continue;
 
-                    // Застосовуємо такий самий контраст до фото з колекції
-                    using var enhancedTarget = new Mat();
-                    clahe.Apply(targetImg, enhancedTarget);
+                    // Застосовуємо ТАКЕ САМЕ збільшення до фото з колекції
+                    using var magnifiedTarget = new Mat();
+                    Cv2.Resize(targetImg, magnifiedTarget, new OpenCvSharp.Size(0, 0), _magnification, _magnification, InterpolationFlags.Cubic);
 
-                    using var orb = ORB.Create(
-                        5000,   // 1. Кількість точок
-                        1.2f,   // 2. ScaleFactor 
-                        8,      // 3. NLevels 
-                        15,     // 4. EdgeThreshold (пускаємо ближче до країв)
-                        0,      // 5. FirstLevel 
-                        2,      // 6. WTA_K 
-                        0,      // 7. ScoreType (Магія C#! Передаємо 0 замість назви)
-                        15,     // 8. PatchSize (зменшуємо візерунок)
-                        10       // 9. FastThreshold (ГОЛОВНЕ: гіперчутливість до дрібних тіней на мордочці)
-                    );
+                    using var enhancedTarget = new Mat();
+                    clahe.Apply(magnifiedTarget, enhancedTarget);
+
+                    using var orb = ORB.Create(5000, 1.2f, 8, 15, 0, 2, 0, 15, 10);
                     using var targetDescriptor = new Mat();
                     orb.DetectAndCompute(enhancedTarget, null, out var targetKeypoints, targetDescriptor);
 
                     if (targetDescriptor.Rows == 0 || _templateDescriptor.Rows == 0) continue;
 
                     var matches = matcher.KnnMatch(_templateDescriptor, targetDescriptor, k: 2);
-
                     var goodMatches = new List<DMatch>();
                     foreach (var m in matches)
                     {
@@ -92,15 +83,12 @@ namespace PictureSearch
                         }
                     }
 
-                    // Зменшили вимогу до початкових точок, щоб ловити менші деталі
-                    // Вимагаємо мінімум 15 хороших точок для старту перевірки (було 8)
                     if (goodMatches.Count >= 15)
                     {
                         var srcPts = goodMatches.Select(m => _templateKeypoints[m.QueryIdx].Pt).Select(p => new Point2d(p.X, p.Y)).ToArray();
                         var dstPts = goodMatches.Select(m => targetKeypoints[m.TrainIdx].Pt).Select(p => new Point2d(p.X, p.Y)).ToArray();
 
                         using var mask = new Mat();
-                        // Зменшуємо похибку RANSAC з 5.0 до 3.0. Точки мають лежати майже ідеально!
                         var homography = Cv2.FindHomography(InputArray.Create(srcPts), InputArray.Create(dstPts), HomographyMethods.Ransac, 3.0, mask);
 
                         if (!homography.Empty())
@@ -114,10 +102,18 @@ namespace PictureSearch
                                 if (b > 0) inliersCount++;
                             }
 
-                            // Якщо маємо 15 ІДЕАЛЬНИХ збігів контурів - це точно наш об'єкт (було 8)
+                            // НОВЕ: Рахуємо "Відсоток достовірності" (Inlier Ratio)
+                            // Ділимо кількість ідеальних точок на кількість усіх хороших збігів
+                            double inlierRatio = (double)inliersCount / goodMatches.Count;
+
+                            // Якщо маємо мінімум 15 ІДЕАЛЬНИХ збігів...
                             if (inliersCount >= 15)
                             {
-                                matchedFiles.Add(collectionPaths[i]);
+                                // ...І ці збіги становлять хоча б 12% від усіх знайдених (відсіюємо море і хаос)
+                                if (inlierRatio >= 0.12)
+                                {
+                                    matchedFiles.Add(collectionPaths[i]);
+                                }
                             }
                         }
                     }
@@ -126,7 +122,6 @@ namespace PictureSearch
 
                 reportProgress(i + 1, total);
             }
-
             return matchedFiles;
         }
     }

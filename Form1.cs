@@ -94,40 +94,6 @@ namespace PictureSearch
             this.Controls.Add(leftPanel);
         }
 
-        private void PicTemplate_MouseDown(object sender, MouseEventArgs e)
-        {
-            if (picTemplate.Image == null) return;
-            isDrawing = true;
-            startPos = e.Location;
-            selectionRect = new Rectangle();
-        }
-
-        private void PicTemplate_MouseMove(object sender, MouseEventArgs e)
-        {
-            if (!isDrawing) return;
-            selectionRect = new Rectangle(
-                Math.Min(startPos.X, e.X), Math.Min(startPos.Y, e.Y),
-                Math.Abs(startPos.X - e.X), Math.Abs(startPos.Y - e.Y));
-            picTemplate.Invalidate();
-        }
-
-        private void PicTemplate_MouseUp(object sender, MouseEventArgs e)
-        {
-            isDrawing = false;
-            if (selectionRect.Width > 10 && selectionRect.Height > 10)
-            {
-                referenceCrop = CropImage(picTemplate.Image, selectionRect);
-                lblStatus.Text = "Еталон виділено!";
-                CheckReadyToSearch();
-            }
-        }
-
-        private void PicTemplate_Paint(object sender, PaintEventArgs e)
-        {
-            if (selectionRect != null && selectionRect.Width > 0)
-                e.Graphics.DrawRectangle(new Pen(Color.Red, 3), selectionRect);
-        }
-
         private Bitmap CropImage(Image img, Rectangle cropArea)
         {
             float ratioW = (float)img.Width / picTemplate.ClientSize.Width;
@@ -153,6 +119,11 @@ namespace PictureSearch
             return bmpCrop;
         }
 
+        // Додаємо змінні для стану "живої рамки" (на початку класу Form1)
+        private enum DragMode { None, Move, ResizeBottomRight }
+        private DragMode currentDragMode = DragMode.None;
+        private Point lastMousePos;
+
         private void BtnLoadTemplate_Click(object sender, EventArgs e)
         {
             using (OpenFileDialog ofd = new OpenFileDialog { Filter = "Image Files|*.jpg;*.jpeg;*.png" })
@@ -160,10 +131,133 @@ namespace PictureSearch
                 if (ofd.ShowDialog() == DialogResult.OK)
                 {
                     picTemplate.Image = Image.FromFile(ofd.FileName);
-                    selectionRect = new Rectangle();
+
+                    // Замість порожнього прямокутника, одразу виділяємо майже все фото, залишаючи невеликі відступи
+                    int margin = 20;
+                    selectionRect = new Rectangle(margin, margin, picTemplate.Width - (margin * 2), picTemplate.Height - (margin * 2));
+
                     referenceCrop = null;
-                    lblStatus.Text = "Виділіть об'єкт мишкою.";
+                    lblStatus.Text = "Налаштуйте рамку та натисніть двічі (або відпустіть), щоб підтвердити.";
+                    picTemplate.Invalidate(); // Перемальовуємо
                 }
+            }
+        }
+
+        private void PicTemplate_MouseDown(object sender, MouseEventArgs e)
+        {
+            if (picTemplate.Image == null) return;
+
+            // Створюємо зону 15 пікселів у правому нижньому куті для "зміни розміру"
+            Rectangle resizeHandle = new Rectangle(selectionRect.Right - 15, selectionRect.Bottom - 15, 30, 30);
+
+            if (resizeHandle.Contains(e.Location))
+            {
+                currentDragMode = DragMode.ResizeBottomRight;
+            }
+            else if (selectionRect.Contains(e.Location))
+            {
+                currentDragMode = DragMode.Move;
+            }
+            else
+            {
+                // Якщо клікнули поза рамкою, малюємо нову з нуля (як було раніше)
+                currentDragMode = DragMode.ResizeBottomRight;
+                selectionRect = new Rectangle(e.Location, new Size(0, 0));
+            }
+
+            lastMousePos = e.Location;
+        }
+
+        private void PicTemplate_MouseMove(object sender, MouseEventArgs e)
+        {
+            if (picTemplate.Image == null) return;
+
+            // Змінюємо курсор, щоб підказати користувачеві, що він може робити
+            Rectangle resizeHandle = new Rectangle(selectionRect.Right - 15, selectionRect.Bottom - 15, 30, 30);
+            if (resizeHandle.Contains(e.Location))
+                picTemplate.Cursor = Cursors.SizeNWSE;
+            else if (selectionRect.Contains(e.Location))
+                picTemplate.Cursor = Cursors.SizeAll;
+            else
+                picTemplate.Cursor = Cursors.Cross;
+
+            if (currentDragMode == DragMode.None) return;
+
+            int dx = e.X - lastMousePos.X;
+            int dy = e.Y - lastMousePos.Y;
+
+            if (currentDragMode == DragMode.Move)
+            {
+                // Переміщення рамки з урахуванням меж картинки
+                int newX = selectionRect.X + dx;
+                int newY = selectionRect.Y + dy;
+
+                // Забороняємо рамці виходити за лівий/верхній край
+                newX = Math.Max(0, newX);
+                newY = Math.Max(0, newY);
+
+                // Забороняємо рамці виходити за правий/нижній край
+                if (newX + selectionRect.Width > picTemplate.ClientSize.Width)
+                    newX = picTemplate.ClientSize.Width - selectionRect.Width;
+                if (newY + selectionRect.Height > picTemplate.ClientSize.Height)
+                    newY = picTemplate.ClientSize.Height - selectionRect.Height;
+
+                selectionRect.X = newX;
+                selectionRect.Y = newY;
+            }
+            else if (currentDragMode == DragMode.ResizeBottomRight)
+            {
+                // Встановлюємо мінімальний розмір рамки (наприклад, 60 пікселів)
+                const int MinSize = 60;
+
+                int newWidth = selectionRect.Width + dx;
+                int newHeight = selectionRect.Height + dy;
+
+                // Забороняємо розтягувати рамку за межі картинки вправо і вниз
+                if (selectionRect.X + newWidth > picTemplate.ClientSize.Width)
+                    newWidth = picTemplate.ClientSize.Width - selectionRect.X;
+                if (selectionRect.Y + newHeight > picTemplate.ClientSize.Height)
+                    newHeight = picTemplate.ClientSize.Height - selectionRect.Y;
+
+                // Застосовуємо мінімальний ліміт
+                selectionRect.Width = Math.Max(MinSize, newWidth);
+                selectionRect.Height = Math.Max(MinSize, newHeight);
+            }
+
+            lastMousePos = e.Location;
+            picTemplate.Invalidate();
+        }
+
+        private void PicTemplate_MouseUp(object sender, MouseEventArgs e)
+        {
+            currentDragMode = DragMode.None;
+
+            // Коли відпустили мишку - фіксуємо еталон
+            if (selectionRect.Width > 10 && selectionRect.Height > 10)
+            {
+                referenceCrop = CropImage(picTemplate.Image, selectionRect);
+                lblStatus.Text = "Еталон виділено та зафіксовано!";
+                CheckReadyToSearch();
+            }
+        }
+
+        private void PicTemplate_Paint(object sender, PaintEventArgs e)
+        {
+            if (selectionRect != null && selectionRect.Width > 0 && selectionRect.Height > 0)
+            {
+                // Затінюємо фон поза рамкою (для краси, стиль Google Lens)
+                Region outerRegion = new Region(picTemplate.ClientRectangle);
+                outerRegion.Exclude(selectionRect);
+                using (Brush brush = new SolidBrush(Color.FromArgb(120, 0, 0, 0)))
+                {
+                    e.Graphics.FillRegion(brush, outerRegion);
+                }
+
+                // Малюємо саму рамку
+                e.Graphics.DrawRectangle(new Pen(Color.LimeGreen, 2), selectionRect);
+
+                // Малюємо "квадратик" для зміни розміру в правому нижньому куті
+                e.Graphics.FillRectangle(Brushes.LimeGreen, selectionRect.Right - 5, selectionRect.Bottom - 5, 10, 10);
             }
         }
 
