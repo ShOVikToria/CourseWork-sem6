@@ -1,10 +1,5 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Drawing;
-using System.Linq;
-using OpenCvSharp;
+﻿using OpenCvSharp;
 using OpenCvSharp.Extensions;
-using OpenCvSharp.Features2D;
 
 namespace PictureSearch
 {
@@ -12,25 +7,27 @@ namespace PictureSearch
     {
         public string TargetClass { get; private set; }
 
-        private Mat _templateDescriptor;
-        private KeyPoint[] _templateKeypoints;
+        private class TemplateVariation
+        {
+            public Mat Descriptor { get; set; }
+            public KeyPoint[] Keypoints { get; set; }
+            public int Width { get; set; }
+            public int Height { get; set; }
+        }
+
+        private List<TemplateVariation> _variations = new List<TemplateVariation>();
         private double _magnification = 1.0;
-        private int _templateWidth;
-        private int _templateHeight;
 
         public void AnalyzeTemplate(Bitmap croppedTemplate)
         {
             if (croppedTemplate == null) return;
 
-            TargetClass = "Пошук (Максимальна точність ORB)...";
+            _variations.Clear(); 
+            TargetClass = "Пошук (ASIFT: 3D Ракурси та Віддзеркалення)...";
 
             _magnification = 1.0;
             int minSide = Math.Min(croppedTemplate.Width, croppedTemplate.Height);
-
-            if (minSide < 100 && minSide > 0)
-            {
-                _magnification = 100.0 / minSide;
-            }
+            if (minSide < 100 && minSide > 0) _magnification = 100.0 / minSide;
 
             using var tempMat = BitmapConverter.ToMat(croppedTemplate);
             using var grayTemplate = new Mat();
@@ -39,18 +36,66 @@ namespace PictureSearch
             using var magnifiedTemplate = new Mat();
             Cv2.Resize(grayTemplate, magnifiedTemplate, new OpenCvSharp.Size(0, 0), _magnification, _magnification, InterpolationFlags.Cubic);
 
-            _templateWidth = magnifiedTemplate.Width;
-            _templateHeight = magnifiedTemplate.Height;
-
             using var enhancedTemplate = new Mat();
-            // ЗМІНЕНО: Підвищили контрастність еталону (clipLimit з 2.0 до 3.0)
             using var clahe = Cv2.CreateCLAHE(clipLimit: 3.0, tileGridSize: new OpenCvSharp.Size(8, 8));
             clahe.Apply(magnifiedTemplate, enhancedTemplate);
 
-            // ЗМІНЕНО: Робимо еталон гіперчутливим до найменших тіней (fastThreshold: 5)
             using var orb = ORB.Create(5000, 1.2f, 8, 15, 0, 2, 0, 15, 5);
-            _templateDescriptor = new Mat();
-            orb.DetectAndCompute(enhancedTemplate, null, out _templateKeypoints, _templateDescriptor);
+
+            AddVariation(orb, enhancedTemplate);
+
+            using var flippedTemplate = new Mat();
+            Cv2.Flip(enhancedTemplate, flippedTemplate, FlipMode.Y);
+            AddVariation(orb, flippedTemplate);
+
+            using var warpedLeft = SimulatePerspective(enhancedTemplate, 0.7f, 1.0f);
+            AddVariation(orb, warpedLeft);
+
+            using var warpedRight = SimulatePerspective(enhancedTemplate, 1.0f, 0.7f);
+            AddVariation(orb, warpedRight);
+        }
+
+        private void AddVariation(ORB orb, Mat image)
+        {
+            var descriptor = new Mat();
+            orb.DetectAndCompute(image, null, out var keypoints, descriptor);
+
+            if (descriptor.Rows > 0)
+            {
+                _variations.Add(new TemplateVariation
+                {
+                    Descriptor = descriptor,
+                    Keypoints = keypoints,
+                    Width = image.Width,
+                    Height = image.Height
+                });
+            }
+        }
+
+        private Mat SimulatePerspective(Mat src, float leftScale, float rightScale)
+        {
+            var dst = new Mat();
+            float w = src.Width;
+            float h = src.Height;
+
+            var srcPoints = new Point2f[] { new Point2f(0, 0), new Point2f(w, 0), new Point2f(0, h), new Point2f(w, h) };
+
+            float leftY = h * (1f - leftScale) / 2f;
+            float rightY = h * (1f - rightScale) / 2f;
+
+            float newW = w * 0.75f;
+            float offsetX = (w - newW) / 2f;
+
+            var dstPoints = new Point2f[] {
+                new Point2f(offsetX, leftY),                 // Верхній лівий
+                new Point2f(offsetX + newW, rightY),         // Верхній правий
+                new Point2f(offsetX, h - leftY),             // Нижній лівий
+                new Point2f(offsetX + newW, h - rightY)      // Нижній правий
+            };
+
+            using var matrix = Cv2.GetPerspectiveTransform(srcPoints, dstPoints);
+            Cv2.WarpPerspective(src, dst, matrix, src.Size(), InterpolationFlags.Cubic);
+            return dst;
         }
 
         public List<string> SearchSequential(List<string> collectionPaths, Action<int, int> reportProgress)
@@ -58,15 +103,13 @@ namespace PictureSearch
             List<string> matchedFiles = new List<string>();
             int total = collectionPaths.Count;
 
-            if (_templateKeypoints == null || _templateKeypoints.Length < 4)
-                return matchedFiles;
+            if (_variations.Count == 0) return matchedFiles;
 
-            bool isSmallTemplate = _templateKeypoints.Length < 150;
+            bool isSmallTemplate = _variations[0].Keypoints.Length < 150;
 
-            // ЗМІНЕНО: Дозволяємо ловити об'єкт навіть за 5 хорошими точками
-            int minRequiredInliers = isSmallTemplate ? 5 : 15;
-            float ratioTestThreshold = isSmallTemplate ? 0.85f : 0.75f;
-            double requiredInlierRatio = isSmallTemplate ? 0.03 : 0.12;
+            int minRequiredInliers = isSmallTemplate ? 5 : 12;
+            float ratioTestThreshold = isSmallTemplate ? 0.85f : 0.78f;
+            double requiredInlierRatio = isSmallTemplate ? 0.03 : 0.08;
 
             using var matcher = new BFMatcher(NormTypes.Hamming, crossCheck: false);
             using var clahe = Cv2.CreateCLAHE(clipLimit: 2.0, tileGridSize: new OpenCvSharp.Size(8, 8));
@@ -84,75 +127,78 @@ namespace PictureSearch
                     using var enhancedTarget = new Mat();
                     clahe.Apply(magnifiedTarget, enhancedTarget);
 
-                    // ЗМІНЕНО: Даємо колекції ліміт у 20 000 точок, щоб дрібні деталі не губилися!
                     using var orb = ORB.Create(20000, 1.2f, 8, 15, 0, 2, 0, 15, 7);
                     using var targetDescriptor = new Mat();
                     orb.DetectAndCompute(enhancedTarget, null, out var targetKeypoints, targetDescriptor);
 
-                    if (targetDescriptor.Rows == 0 || _templateDescriptor.Rows == 0) continue;
+                    if (targetDescriptor.Rows == 0) continue;
 
-                    var matches = matcher.KnnMatch(_templateDescriptor, targetDescriptor, k: 2);
-                    var goodMatches = new List<DMatch>();
+                    bool isMatchFound = false;
 
-                    foreach (var m in matches)
+                    foreach (var variation in _variations)
                     {
-                        if (m.Length > 1 && m[0].Distance < ratioTestThreshold * m[1].Distance)
-                            goodMatches.Add(m[0]);
-                    }
+                        var matches = matcher.KnnMatch(variation.Descriptor, targetDescriptor, k: 2);
+                        var goodMatches = new List<DMatch>();
 
-                    if (goodMatches.Count >= minRequiredInliers)
-                    {
-                        var srcPts = goodMatches.Select(m => _templateKeypoints[m.QueryIdx].Pt).Select(p => new Point2d(p.X, p.Y)).ToArray();
-                        var dstPts = goodMatches.Select(m => targetKeypoints[m.TrainIdx].Pt).Select(p => new Point2d(p.X, p.Y)).ToArray();
-
-                        using var mask = new Mat();
-                        // ЗМІНЕНО: Послаблюємо RANSAC для малих об'єктів (5.0 замість 3.0), бо малі деталі можуть трохи "з'їжджати"
-                        double ransacError = isSmallTemplate ? 5.0 : 3.0;
-                        var homography = Cv2.FindHomography(InputArray.Create(srcPts), InputArray.Create(dstPts), HomographyMethods.Ransac, ransacError, mask);
-
-                        if (!homography.Empty())
+                        foreach (var m in matches)
                         {
-                            var objCorners = new Point2d[] {
-                                new Point2d(0, 0),
-                                new Point2d(_templateWidth, 0),
-                                new Point2d(_templateWidth, _templateHeight),
-                                new Point2d(0, _templateHeight)
-                            };
+                            if (m.Length > 1 && m[0].Distance < ratioTestThreshold * m[1].Distance)
+                                goodMatches.Add(m[0]);
+                        }
 
-                            var sceneCorners = Cv2.PerspectiveTransform(objCorners, homography);
-                            var pointsForConvex = sceneCorners.Select(p => new OpenCvSharp.Point((int)p.X, (int)p.Y)).ToList();
+                        if (goodMatches.Count >= minRequiredInliers)
+                        {
+                            var srcPts = goodMatches.Select(m => variation.Keypoints[m.QueryIdx].Pt).Select(p => new Point2d(p.X, p.Y)).ToArray();
+                            var dstPts = goodMatches.Select(m => targetKeypoints[m.TrainIdx].Pt).Select(p => new Point2d(p.X, p.Y)).ToArray();
 
-                            // ЗМІНЕНО: Геометрична перевірка тепер гнучка!
-                            // Для малих ділянок ми вимикаємо перевірку на "перекручування", бо матриця перспективи на 5 точках завжди трохи ламається
-                            bool isConvex = Cv2.IsContourConvex(pointsForConvex);
-                            bool geometryPassed = isSmallTemplate ? true : isConvex;
+                            using var mask = new Mat();
+                            double ransacError = isSmallTemplate ? 5.0 : 4.0;
+                            var homography = Cv2.FindHomography(InputArray.Create(srcPts), InputArray.Create(dstPts), HomographyMethods.Ransac, ransacError, mask);
 
-                            // Площа все одно не повинна бути мікроскопічною (мінімум 2% від еталону)
-                            double area = Cv2.ContourArea(pointsForConvex);
-                            bool isAreaValid = area > (_templateWidth * _templateHeight * 0.02);
-
-                            if (geometryPassed && isAreaValid)
+                            if (!homography.Empty())
                             {
-                                int inliersCount = 0;
-                                byte[] maskBytes = new byte[mask.Rows * mask.Cols];
-                                System.Runtime.InteropServices.Marshal.Copy(mask.Data, maskBytes, 0, maskBytes.Length);
+                                var objCorners = new Point2d[] {
+                                    new Point2d(0, 0),
+                                    new Point2d(variation.Width, 0),
+                                    new Point2d(variation.Width, variation.Height),
+                                    new Point2d(0, variation.Height)
+                                };
 
-                                foreach (var b in maskBytes)
-                                {
-                                    if (b > 0) inliersCount++;
-                                }
+                                var sceneCorners = Cv2.PerspectiveTransform(objCorners, homography);
+                                var pointsForConvex = sceneCorners.Select(p => new OpenCvSharp.Point((int)p.X, (int)p.Y)).ToList();
 
-                                if (inliersCount >= minRequiredInliers)
+                                bool isConvex = Cv2.IsContourConvex(pointsForConvex);
+                                bool geometryPassed = isSmallTemplate ? true : isConvex;
+
+                                double area = Cv2.ContourArea(pointsForConvex);
+                                bool isAreaValid = area > (variation.Width * variation.Height * 0.02);
+
+                                if (geometryPassed && isAreaValid)
                                 {
-                                    double inlierRatio = (double)inliersCount / goodMatches.Count;
-                                    if (inlierRatio >= requiredInlierRatio)
+                                    int inliersCount = 0;
+                                    byte[] maskBytes = new byte[mask.Rows * mask.Cols];
+                                    System.Runtime.InteropServices.Marshal.Copy(mask.Data, maskBytes, 0, maskBytes.Length);
+
+                                    foreach (var b in maskBytes)
                                     {
-                                        matchedFiles.Add(collectionPaths[i]);
+                                        if (b > 0) inliersCount++;
+                                    }
+
+                                    if (inliersCount >= minRequiredInliers)
+                                    {
+                                        double inlierRatio = (double)inliersCount / goodMatches.Count;
+                                        if (inlierRatio >= requiredInlierRatio)
+                                        {
+                                            isMatchFound = true;
+                                            break;
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+
+                    if (isMatchFound) matchedFiles.Add(collectionPaths[i]);
                 }
                 catch (Exception) { }
 

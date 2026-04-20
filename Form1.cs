@@ -16,6 +16,7 @@ namespace PictureSearch
         private Button btnLoadTemplate, btnLoadCollection, btnSearch, btnReset;
         private Label lblStatus;
         private ProgressBar progressBar;
+        private CheckBox chkEnableThumbnails;
 
         private ImageAnalyzer analyzer;
         private List<string> collectionPaths = new List<string>();
@@ -36,6 +37,7 @@ namespace PictureSearch
             this.Text = "Курсова: Пошук об'єктів (Послідовний режим)";
             this.Size = new Size(1100, 700);
             this.StartPosition = FormStartPosition.CenterScreen;
+            this.FormClosing += Form1_FormClosing;
 
             Panel leftPanel = new Panel { Dock = DockStyle.Left, Width = 350, Padding = new Padding(10) };
 
@@ -92,6 +94,15 @@ namespace PictureSearch
 
             this.Controls.Add(splitRight);
             this.Controls.Add(leftPanel);
+
+            chkEnableThumbnails = new CheckBox
+            {
+                Text = "Показувати мініатюри (уповільнює завантаження)",
+                Checked = false, // За замовчуванням вимкнено для швидкості
+                Dock = DockStyle.Top,
+                Height = 30
+            };
+            leftPanel.Controls.Add(chkEnableThumbnails);
         }
 
         private Bitmap CropImage(Image img, Rectangle cropArea)
@@ -119,7 +130,11 @@ namespace PictureSearch
             return bmpCrop;
         }
 
-        // Додаємо змінні для стану "живої рамки" (на початку класу Form1)
+        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            Environment.Exit(0);
+        }
+
         private enum DragMode { None, Move, ResizeBottomRight }
         private DragMode currentDragMode = DragMode.None;
         private Point lastMousePos;
@@ -288,22 +303,31 @@ namespace PictureSearch
                     lblStatus.Text = $"Створення мініатюр для {collectionPaths.Count} фото...";
                     Application.DoEvents();
 
+                    bool showThumbs = chkEnableThumbnails.Checked;
+
+                    // Якщо мініатюри вимкнені, перемикаємо ListView у режим списку (це набагато швидше)
+                    listCollection.View = showThumbs ? View.LargeIcon : View.List;
+
                     foreach (string file in collectionPaths)
                     {
                         try
                         {
-                            using (Image originalImg = Image.FromFile(file))
+                            if (showThumbs)
                             {
-                                Image thumb = originalImg.GetThumbnailImage(80, 80, () => false, IntPtr.Zero);
-                                imageListCollection.Images.Add(file, thumb);
+                                using (Image originalImg = Image.FromFile(file))
+                                {
+                                    Image thumb = originalImg.GetThumbnailImage(80, 80, () => false, IntPtr.Zero);
+                                    imageListCollection.Images.Add(file, thumb);
+                                }
+                                listCollection.Items.Add(new ListViewItem { ImageKey = file, Text = Path.GetFileName(file), Tag = file });
                             }
-                            // Додаємо в список. Text - це лише ім'я файлу, а Tag - повний шлях
-                            listCollection.Items.Add(new ListViewItem { ImageKey = file, Text = Path.GetFileName(file), Tag = file });
+                            else
+                            {
+                                // ПРОСТИЙ РЕЖИМ: жодного зчитування файлу, просто додаємо назву
+                                listCollection.Items.Add(new ListViewItem { Text = Path.GetFileName(file), Tag = file });
+                            }
                         }
-                        catch
-                        {
-                            // Якщо трапився якийсь "битий" файл зображення - просто пропускаємо його
-                        }
+                        catch { /* пропустити биті файли */ }
                     }
 
                     lblStatus.Text = $"Завантажено {collectionPaths.Count} фото з усіх підпапок.";
