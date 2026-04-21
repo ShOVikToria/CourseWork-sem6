@@ -5,6 +5,7 @@ using System.IO;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using System.Diagnostics;
+using System.Linq;
 
 namespace PictureSearch
 {
@@ -18,42 +19,69 @@ namespace PictureSearch
         private ProgressBar progressBar;
         private CheckBox chkEnableThumbnails;
 
+        // НОВІ ЕЛЕМЕНТИ ДЛЯ ПАРАЛЕЛЬНОЇ ОБРОБКИ
+        private RadioButton rbSequential, rbParallel;
+        private ComboBox cmbThreads;
+        private GroupBox grpSettings;
+
         private ImageAnalyzer analyzer;
         private List<string> collectionPaths = new List<string>();
         private Rectangle selectionRect;
-        private Point startPos;
-        private bool isDrawing = false;
         private Bitmap referenceCrop = null;
 
         public Form1()
         {
-            InitializeComponent(); // Викликаємо стандартний метод дизайнера
-            InitializeCustomUI();  // Викликаємо наш метод
+            InitializeComponent();
+            InitializeCustomUI();
             analyzer = new ImageAnalyzer();
         }
 
         private void InitializeCustomUI()
         {
-            this.Text = "Курсова: Пошук об'єктів (Послідовний режим)";
-            this.Size = new Size(1100, 700);
+            this.Text = "Курсова: Пошук об'єктів (Паралельний аналіз)";
+            this.Size = new Size(1150, 750);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.FormClosing += Form1_FormClosing;
 
             Panel leftPanel = new Panel { Dock = DockStyle.Left, Width = 350, Padding = new Padding(10) };
 
+            // --- БЛОК 1: ЕТАЛОН ---
             btnLoadTemplate = new Button { Text = "1. Завантажити еталон", Dock = DockStyle.Top, Height = 40 };
             btnLoadTemplate.Click += BtnLoadTemplate_Click;
 
-            picTemplate = new PictureBox { Dock = DockStyle.Top, Height = 300, SizeMode = PictureBoxSizeMode.Zoom, BorderStyle = BorderStyle.FixedSingle, Cursor = Cursors.Cross };
+            picTemplate = new PictureBox { Dock = DockStyle.Top, Height = 250, SizeMode = PictureBoxSizeMode.Zoom, BorderStyle = BorderStyle.FixedSingle, Cursor = Cursors.Cross };
             picTemplate.Paint += PicTemplate_Paint;
             picTemplate.MouseDown += PicTemplate_MouseDown;
             picTemplate.MouseMove += PicTemplate_MouseMove;
             picTemplate.MouseUp += PicTemplate_MouseUp;
 
+            // --- БЛОК 2: КОЛЕКЦІЯ ---
             btnLoadCollection = new Button { Text = "2. Вибрати колекцію", Dock = DockStyle.Top, Height = 40, Margin = new Padding(0, 10, 0, 0) };
             btnLoadCollection.Click += BtnLoadCollection_Click;
 
-            btnSearch = new Button { Text = "3. ПОШУК", Dock = DockStyle.Top, Height = 50, BackColor = Color.LightGreen, Enabled = false };
+            chkEnableThumbnails = new CheckBox { Text = "Показувати мініатюри", Checked = false, Dock = DockStyle.Top, Height = 30 };
+
+            // --- БЛОК 3: НАЛАШТУВАННЯ ПАРАЛЕЛЬНОСТІ ---
+            grpSettings = new GroupBox { Text = "Параметри виконання", Dock = DockStyle.Top, Height = 120, Padding = new Padding(10) };
+
+            rbSequential = new RadioButton { Text = "Послідовний режим", Checked = true, Location = new Point(10, 25), AutoSize = true };
+            rbParallel = new RadioButton { Text = "Паралельний режим", Location = new Point(10, 50), AutoSize = true };
+
+            Label lblThreads = new Label { Text = "Кількість потоків:", Location = new Point(10, 82), Width = 115 };
+            cmbThreads = new ComboBox { Location = new Point(115, 80), Width = 100, DropDownStyle = ComboBoxStyle.DropDownList };
+            cmbThreads.Items.AddRange(new object[] { "Авто", "2", "4", "6", "8", "12", "16" });
+            cmbThreads.SelectedIndex = 0;
+            cmbThreads.Enabled = false;
+
+            rbParallel.CheckedChanged += (s, e) => cmbThreads.Enabled = rbParallel.Checked;
+
+            grpSettings.Controls.Add(rbSequential);
+            grpSettings.Controls.Add(rbParallel);
+            grpSettings.Controls.Add(lblThreads);
+            grpSettings.Controls.Add(cmbThreads);
+
+            // --- БЛОК 4: КЕРУВАННЯ ТА СТАТУС ---
+            btnSearch = new Button { Text = "3. ПОШУК", Dock = DockStyle.Top, Height = 50, BackColor = Color.LightGreen, Enabled = false, Font = new Font(this.Font, FontStyle.Bold) };
             btnSearch.Click += BtnSearch_Click;
 
             btnReset = new Button { Text = "Скинути", Dock = DockStyle.Bottom, Height = 40, BackColor = Color.LightCoral };
@@ -62,7 +90,10 @@ namespace PictureSearch
             progressBar = new ProgressBar { Dock = DockStyle.Bottom, Height = 20 };
             lblStatus = new Label { Dock = DockStyle.Bottom, Height = 30, Text = "Очікування...", TextAlign = ContentAlignment.MiddleCenter };
 
+            // Додаємо в зворотному порядку для правильного DockTop
             leftPanel.Controls.Add(btnSearch);
+            leftPanel.Controls.Add(grpSettings);
+            leftPanel.Controls.Add(chkEnableThumbnails);
             leftPanel.Controls.Add(btnLoadCollection);
             leftPanel.Controls.Add(picTemplate);
             leftPanel.Controls.Add(btnLoadTemplate);
@@ -70,39 +101,24 @@ namespace PictureSearch
             leftPanel.Controls.Add(progressBar);
             leftPanel.Controls.Add(btnReset);
 
+            // --- ПРАВА ПАНЕЛЬ ---
             SplitContainer splitRight = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal };
-
             imageListCollection = new ImageList { ImageSize = new Size(80, 80), ColorDepth = ColorDepth.Depth32Bit };
             imageListResults = new ImageList { ImageSize = new Size(100, 100), ColorDepth = ColorDepth.Depth32Bit };
 
-            listCollection = new ListView { Dock = DockStyle.Fill, View = View.LargeIcon, LargeImageList = imageListCollection };
+            listCollection = new ListView { Dock = DockStyle.Fill, View = View.List, LargeImageList = imageListCollection };
             listCollection.DoubleClick += List_DoubleClick;
 
             listResults = new ListView { Dock = DockStyle.Fill, View = View.LargeIcon, LargeImageList = imageListResults, BackColor = Color.Honeydew };
             listResults.DoubleClick += List_DoubleClick;
 
-            Panel pnlTop = new Panel { Dock = DockStyle.Fill };
-            pnlTop.Controls.Add(listCollection);
-            pnlTop.Controls.Add(new Label { Text = "Вся колекція:", Dock = DockStyle.Top, Height = 25, Font = new Font("Arial", 10, FontStyle.Bold) });
-
-            Panel pnlBottom = new Panel { Dock = DockStyle.Fill };
-            pnlBottom.Controls.Add(listResults);
-            pnlBottom.Controls.Add(new Label { Text = "Результати пошуку:", Dock = DockStyle.Top, Height = 25, Font = new Font("Arial", 10, FontStyle.Bold) });
-
-            splitRight.Panel1.Controls.Add(pnlTop);
-            splitRight.Panel2.Controls.Add(pnlBottom);
+            splitRight.Panel1.Controls.Add(listCollection);
+            splitRight.Panel1.Controls.Add(new Label { Text = "Вся колекція:", Dock = DockStyle.Top, Height = 25, Font = new Font("Arial", 10, FontStyle.Bold) });
+            splitRight.Panel2.Controls.Add(listResults);
+            splitRight.Panel2.Controls.Add(new Label { Text = "Результати пошуку:", Dock = DockStyle.Top, Height = 25, Font = new Font("Arial", 10, FontStyle.Bold) });
 
             this.Controls.Add(splitRight);
             this.Controls.Add(leftPanel);
-
-            chkEnableThumbnails = new CheckBox
-            {
-                Text = "Показувати мініатюри (уповільнює завантаження)",
-                Checked = false, // За замовчуванням вимкнено для швидкості
-                Dock = DockStyle.Top,
-                Height = 30
-            };
-            leftPanel.Controls.Add(chkEnableThumbnails);
         }
 
         private Bitmap CropImage(Image img, Rectangle cropArea)
@@ -132,7 +148,7 @@ namespace PictureSearch
 
         private void Form1_FormClosing(object sender, FormClosingEventArgs e)
         {
-            Environment.Exit(0);
+            System.Diagnostics.Process.GetCurrentProcess().Kill();
         }
 
         private enum DragMode { None, Move, ResizeBottomRight }
@@ -353,11 +369,7 @@ namespace PictureSearch
 
         private async void BtnSearch_Click(object sender, EventArgs e)
         {
-            if (referenceCrop == null)
-            {
-                MessageBox.Show("Помилка: Еталон не виділено!", "Увага", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
+            if (referenceCrop == null) return;
 
             btnSearch.Enabled = false;
             listResults.Items.Clear();
@@ -367,29 +379,64 @@ namespace PictureSearch
             lblStatus.Text = "Аналіз еталону...";
             await Task.Run(() => analyzer.AnalyzeTemplate(referenceCrop));
 
-            lblStatus.Text = $"Шукаю: {analyzer.TargetClass}...";
+            // Визначаємо режим та кількість ядер
+            bool useParallel = rbParallel.Checked;
+            int threadCount = -1;
+            if (useParallel && cmbThreads.Text != "Авто")
+            {
+                threadCount = int.Parse(cmbThreads.Text);
+            }
+
+            lblStatus.Text = useParallel ? $"Паралельний пошук ({cmbThreads.Text} ядер)..." : "Послідовний пошук...";
             Stopwatch sw = Stopwatch.StartNew();
 
-            List<string> results = await Task.Run(() =>
-                analyzer.SearchSequential(collectionPaths, (current, total) =>
+            long lastUiUpdate = 0;
+
+            Action<int, int> progressCallback = (current, total) =>
+            {
+                long now = Stopwatch.GetTimestamp();
+                long elapsed = (now - Interlocked.Read(ref lastUiUpdate)) * 1000 / Stopwatch.Frequency;
+
+                // Оновлюємо UI не частіше ніж раз на 100мс АБО на останньому елементі
+                if (elapsed >= 100 || current == total)
                 {
-                    this.Invoke(new Action(() => progressBar.Value = (int)((double)current / total * 100)));
-                })
-            );
+                    Interlocked.Exchange(ref lastUiUpdate, now);
+                    this.BeginInvoke(new Action(() =>
+                    {
+                        progressBar.Value = (int)((double)current / total * 100);
+                        lblStatus.Text = $"Оброблено: {current} / {total}";
+                    }));
+                }
+            };
+
+            List<string> results;
+            if (useParallel)
+            {
+                results = await Task.Run(() => analyzer.SearchParallel(collectionPaths, progressCallback, threadCount));
+            }
+            else
+            {
+                results = await Task.Run(() => analyzer.SearchSequential(collectionPaths, progressCallback));
+            }
 
             sw.Stop();
 
+            // Виведення результатів
             foreach (string file in results)
             {
-                using (Image originalImg = Image.FromFile(file))
+                try
                 {
-                    Image thumb = originalImg.GetThumbnailImage(100, 100, () => false, IntPtr.Zero);
-                    imageListResults.Images.Add(file, thumb);
+                    using (Image originalImg = Image.FromFile(file))
+                    {
+                        Image thumb = originalImg.GetThumbnailImage(100, 100, () => false, IntPtr.Zero);
+                        imageListResults.Images.Add(file, thumb);
+                    }
+                    listResults.Items.Add(new ListViewItem { ImageKey = file, Text = Path.GetFileName(file), Tag = file });
                 }
-                listResults.Items.Add(new ListViewItem { ImageKey = file, Text = Path.GetFileName(file), Tag = file });
+                catch { }
             }
 
-            lblStatus.Text = $"Знайдено: {results.Count}. Час: {sw.ElapsedMilliseconds} мс.";
+            lblStatus.Text = $"Знайдено: {results.Count}. Режим: {(useParallel ? "Паралельний" : "Послідовний")}. Час: {sw.ElapsedMilliseconds} мс.";
             btnSearch.Enabled = true;
         }
 
