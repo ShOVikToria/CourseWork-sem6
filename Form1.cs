@@ -417,6 +417,7 @@ namespace PictureSearch
             else
             {
                 results = await Task.Run(() => analyzer.SearchSequential(collectionPaths, progressCallback));
+                MessageBox.Show(analyzer.LastProfilingResult, "Профілювання Sequential");
             }
 
             sw.Stop();
