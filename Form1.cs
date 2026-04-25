@@ -19,7 +19,6 @@ namespace PictureSearch
         private ProgressBar progressBar;
         private CheckBox chkEnableThumbnails;
 
-        // НОВІ ЕЛЕМЕНТИ ДЛЯ ПАРАЛЕЛЬНОЇ ОБРОБКИ
         private RadioButton rbSequential, rbParallel;
         private ComboBox cmbThreads;
         private GroupBox grpSettings;
@@ -67,8 +66,8 @@ namespace PictureSearch
             rbSequential = new RadioButton { Text = "Послідовний режим", Checked = true, Location = new Point(10, 25), AutoSize = true };
             rbParallel = new RadioButton { Text = "Паралельний режим", Location = new Point(10, 50), AutoSize = true };
 
-            Label lblThreads = new Label { Text = "Кількість потоків:", Location = new Point(10, 82), Width = 115 };
-            cmbThreads = new ComboBox { Location = new Point(115, 80), Width = 100, DropDownStyle = ComboBoxStyle.DropDownList };
+            Label lblThreads = new Label { Text = "Кількість потоків:", Location = new Point(10, 82), Width = 110 };
+            cmbThreads = new ComboBox { Location = new Point(120, 80), Width = 92, DropDownStyle = ComboBoxStyle.DropDownList };
             cmbThreads.Items.AddRange(new object[] { "Авто", "2", "4", "6", "8", "12", "16" });
             cmbThreads.SelectedIndex = 0;
             cmbThreads.Enabled = false;
@@ -417,7 +416,6 @@ namespace PictureSearch
             else
             {
                 results = await Task.Run(() => analyzer.SearchSequential(collectionPaths, progressCallback));
-                MessageBox.Show(analyzer.LastProfilingResult, "Профілювання Sequential");
             }
 
             sw.Stop();
