@@ -1,11 +1,14 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using System.Diagnostics;
-using System.Linq;
+using OpenCvSharp;
+using Point = System.Drawing.Point;
+using Size = System.Drawing.Size;
 
 namespace PictureSearch
 {
@@ -14,7 +17,7 @@ namespace PictureSearch
         private PictureBox picTemplate;
         private ListView listCollection, listResults;
         private ImageList imageListCollection, imageListResults;
-        private Button btnLoadTemplate, btnLoadCollection, btnSearch, btnReset;
+        private Button btnLoadTemplate, btnLoadCollection, btnSearch, btnReset, btnRunExperiment;
         private Label lblStatus;
         private ProgressBar progressBar;
         private CheckBox chkEnableThumbnails;
@@ -22,6 +25,7 @@ namespace PictureSearch
         private RadioButton rbSequential, rbParallel;
         private ComboBox cmbThreads;
         private GroupBox grpSettings;
+
 
         private ImageAnalyzer analyzer;
         private List<string> collectionPaths = new List<string>();
@@ -86,10 +90,14 @@ namespace PictureSearch
             btnReset = new Button { Text = "Скинути", Dock = DockStyle.Bottom, Height = 40, BackColor = Color.LightCoral };
             btnReset.Click += BtnReset_Click;
 
+            btnRunExperiment = new Button { Text = "4. ДОСЛІДИТИ ПРОДУКТИВНІСТЬ", Dock = DockStyle.Top, Height = 40, BackColor = Color.LightSkyBlue, Enabled = false };
+            btnRunExperiment.Click += btnRunExperiment_Click;
+
             progressBar = new ProgressBar { Dock = DockStyle.Bottom, Height = 20 };
             lblStatus = new Label { Dock = DockStyle.Bottom, Height = 30, Text = "Очікування...", TextAlign = ContentAlignment.MiddleCenter };
 
             // Додаємо в зворотному порядку для правильного DockTop
+            leftPanel.Controls.Add(btnRunExperiment);
             leftPanel.Controls.Add(btnSearch);
             leftPanel.Controls.Add(grpSettings);
             leftPanel.Controls.Add(chkEnableThumbnails);
@@ -354,6 +362,11 @@ namespace PictureSearch
         private void CheckReadyToSearch()
         {
             btnSearch.Enabled = referenceCrop != null && collectionPaths.Count > 0;
+
+            if (btnRunExperiment != null)
+            {
+                btnRunExperiment.Enabled = referenceCrop != null;
+            }
         }
 
         private void List_DoubleClick(object sender, EventArgs e)
@@ -449,9 +462,12 @@ namespace PictureSearch
             listResults.Items.Clear();
             imageListCollection.Images.Clear();
             imageListResults.Images.Clear();
+
             btnSearch.Enabled = false;
+            if (btnRunExperiment != null) btnRunExperiment.Enabled = false;
+
             progressBar.Value = 0;
-            lblStatus.Text = "Скинуто.";
+            lblStatus.Text = "Скинуто. Завантажте еталон та колекцію.";
         }
 
         private List<string> GetImagesRecursively(string path)
@@ -486,6 +502,146 @@ namespace PictureSearch
             }
 
             return files;
+        }
+
+        private async void btnRunExperiment_Click(object sender, EventArgs e)
+        {
+            if (referenceCrop == null)
+            {
+                MessageBox.Show("Спочатку завантажте та виділіть еталон!");
+                return;
+            }
+
+            lblStatus.Text = "Аналіз еталону...";
+            await Task.Run(() => analyzer.AnalyzeTemplate(referenceCrop));
+
+            using (FolderBrowserDialog fbd = new FolderBrowserDialog())
+            {
+                fbd.Description = "Виберіть ГОЛОВНУ папку, яка містить підпапки з різними наборами зображень (наприклад: Set_50, Set_200 тощо)";
+
+                if (fbd.ShowDialog() != DialogResult.OK) return;
+
+                string rootPath = fbd.SelectedPath;
+                string[] subDirs = Directory.GetDirectories(rootPath);
+
+                if (subDirs.Length == 0)
+                {
+                    subDirs = new string[] { rootPath };
+                }
+
+                btnRunExperiment.Enabled = false;
+                btnSearch.Enabled = false;
+                progressBar.Value = 0;
+
+                int[] threads = { 4, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+
+                string csvPath = Path.Combine(rootPath, $"BenchmarkResults_{DateTime.Now:yyyyMMdd_HHmmss}.csv");
+                System.Text.StringBuilder csvContent = new System.Text.StringBuilder();
+                csvContent.AppendLine("Кількість зображень,Потоки,Час послідовного (мс),Час паралельного (мс),Прискорення (x)");
+
+                await Task.Run(() =>
+                {
+                    List<List<string>> allTestSets = new List<List<string>>();
+                    foreach (string dir in subDirs)
+                    {
+                        var paths = GetImagesRecursively(dir);
+                        if (paths.Count > 0) allTestSets.Add(paths);
+                    }
+                    allTestSets = allTestSets.OrderBy(set => set.Count).ToList();
+
+                    if (allTestSets.Count == 0) return;
+
+                    this.BeginInvoke(new Action(() => lblStatus.Text = "Розігрів JIT-компілятора (Warm-up)..."));
+
+                    var warmupPaths = allTestSets[0].Take(Math.Min(10, allTestSets[0].Count)).ToList();
+                    var warmupImages = new List<Mat>();
+                    foreach (var path in warmupPaths)
+                    {
+                        try
+                        {
+                            var img = Cv2.ImRead(path, ImreadModes.Grayscale);
+                            warmupImages.Add(img ?? new Mat());
+                        }
+                        catch { warmupImages.Add(new Mat()); }
+                    }
+
+                    analyzer.SearchSequential(warmupPaths, null, warmupImages);
+                    analyzer.SearchParallel(warmupPaths, null, 4, warmupImages);
+
+                    foreach (var img in warmupImages) if (img != null && !img.IsDisposed) img.Dispose();
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+
+                    int totalRuns = allTestSets.Count * (1 + threads.Length);
+                    int completedRuns = 0;
+
+                    foreach (List<string> currentPaths in allTestSets)
+                    {
+                        this.BeginInvoke(new Action(() => lblStatus.Text = $"Завантаження набору з {currentPaths.Count} зображень..."));
+
+                        List<Mat> preloadedImages = new List<Mat>();
+                        foreach (var path in currentPaths)
+                        {
+                            try
+                            {
+                                var img = Cv2.ImRead(path, ImreadModes.Grayscale);
+                                preloadedImages.Add(img ?? new Mat());
+                            }
+                            catch { preloadedImages.Add(new Mat()); }
+                        }
+
+                        int actualSize = preloadedImages.Count;
+                        if (actualSize == 0) continue;
+
+                        this.BeginInvoke(new Action(() => lblStatus.Text = $"Тест послідовного алгоритму ({actualSize} фото)..."));
+                        Stopwatch sw = Stopwatch.StartNew();
+                        analyzer.SearchSequential(currentPaths, null, preloadedImages);
+                        sw.Stop();
+                        long seqTime = sw.ElapsedMilliseconds;
+
+                        completedRuns++;
+                        this.BeginInvoke(new Action(() => progressBar.Value = (int)((double)completedRuns / totalRuns * 100)));
+
+                        foreach (int t in threads)
+                        {
+                            this.BeginInvoke(new Action(() => lblStatus.Text = $"Тест паралельного: {t} потоків ({actualSize} фото)..."));
+
+                            GC.Collect();
+                            GC.WaitForPendingFinalizers();
+
+                            sw.Restart();
+                            analyzer.SearchParallel(currentPaths, null, t, preloadedImages);
+                            sw.Stop();
+
+                            long parTime = sw.ElapsedMilliseconds;
+                            double speedup = (double)seqTime / parTime;
+
+                            string speedupStr = speedup.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture);
+                            csvContent.AppendLine($"{actualSize},{t},{seqTime},{parTime},{speedupStr}");
+
+                            completedRuns++;
+                            this.BeginInvoke(new Action(() => progressBar.Value = (int)((double)completedRuns / totalRuns * 100)));
+                        }
+
+                        foreach (var img in preloadedImages)
+                        {
+                            if (img != null && !img.IsDisposed) img.Dispose();
+                        }
+                        preloadedImages.Clear();
+                    }
+
+                    File.WriteAllText(csvPath, csvContent.ToString(), System.Text.Encoding.UTF8);
+                });
+
+                this.BeginInvoke(new Action(() =>
+                {
+                    progressBar.Value = 100;
+                    lblStatus.Text = "Експеримент успішно завершено!";
+                    btnRunExperiment.Enabled = true;
+                    CheckReadyToSearch();
+                    MessageBox.Show($"Дослідження завершено!\nРезультати збережено у файл:\n{csvPath}", "Готово", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }));
+            }
         }
     }
 }
