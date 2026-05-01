@@ -212,7 +212,7 @@ namespace PictureSearch
             );
         }
 
-        public List<string> SearchSequential(List<string> collectionPaths, Action<int, int> reportProgress)
+        public List<string> SearchSequential(List<string> collectionPaths, Action<int, int> reportProgress, List<Mat> preloadedImages = null)
         {
             List<string> matchedFiles = new List<string>();
             int total = collectionPaths.Count;
@@ -234,8 +234,10 @@ namespace PictureSearch
             {
                 try
                 {
-                    using var targetImg = Cv2.ImRead(collectionPaths[i], ImreadModes.Grayscale);
-                    if (targetImg.Empty()) continue;
+                    using Mat imgFromDisk = preloadedImages == null ? Cv2.ImRead(collectionPaths[i], ImreadModes.Grayscale) : null;
+                    Mat targetImg = preloadedImages != null ? preloadedImages[i] : imgFromDisk;
+
+                    if (targetImg == null || targetImg.Empty()) continue;
 
                     PreprocessImage(targetImg, magnifiedTarget, enhancedTarget, targetDescriptor, clahe, orb, out var targetKeypoints);
 
@@ -247,11 +249,12 @@ namespace PictureSearch
                 }
                 catch (Exception) { }
 
-                reportProgress(i + 1, total);
+                reportProgress?.Invoke(i + 1, total);
             }
             return matchedFiles;
         }
-        public List<string> SearchParallel(List<string> collectionPaths, Action<int, int> reportProgress, int threadCount = -1)
+
+        public List<string> SearchParallel(List<string> collectionPaths, Action<int, int> reportProgress, int threadCount = -1, List<Mat> preloadedImages = null)
         {
             List<string> matchedFiles = new List<string>();
             int total = collectionPaths.Count;
@@ -260,7 +263,6 @@ namespace PictureSearch
                 return matchedFiles;
 
             Cv2.SetNumThreads(1);
-
             var config = GetMatchConfig();
 
             var matchedBag = new ConcurrentBag<string>();
@@ -272,7 +274,6 @@ namespace PictureSearch
             Parallel.ForEach(
                 Partitioner.Create(0, total, chunkSize),
                 new ParallelOptions { MaxDegreeOfParallelism = degreeOfParallelism },
-
                 () => new
                 {
                     matcher = new BFMatcher(NormTypes.Hamming, crossCheck: false),
@@ -282,7 +283,6 @@ namespace PictureSearch
                     enhTarget = new Mat(),
                     targetDesc = new Mat()
                 },
-
                 (range, loopState, localState) =>
                 {
                     for (int i = range.Item1; i < range.Item2; i++)
@@ -291,15 +291,17 @@ namespace PictureSearch
 
                         try
                         {
-                            using var targetImg = Cv2.ImRead(path, ImreadModes.Grayscale);
+                            using Mat imgFromDisk = preloadedImages == null ? Cv2.ImRead(path, ImreadModes.Grayscale) : null;
+                            Mat targetImg = preloadedImages != null ? preloadedImages[i] : imgFromDisk;
 
-                            if (targetImg.Empty()) continue;
+                            if (targetImg == null || targetImg.Empty()) continue;
 
                             PreprocessImage(targetImg, localState.magTarget, localState.enhTarget, localState.targetDesc, localState.clahe, localState.orb, out var targetKeypoints);
 
                             if (localState.targetDesc.Rows < config.MinInliers) continue;
 
-                            bool isMatchFound = CheckIfMatchFound(localState.targetDesc, targetKeypoints, localState.matcher, config);
+                            bool isMatchFound = CheckIfMatchFound(
+                                localState.targetDesc, targetKeypoints, localState.matcher, config);
 
                             if (isMatchFound) matchedBag.Add(path);
                         }
@@ -308,12 +310,11 @@ namespace PictureSearch
                         int current = Interlocked.Increment(ref processedCount);
                         if (current % 20 == 0 || current == total)
                         {
-                            reportProgress(current, total);
+                            reportProgress?.Invoke(current, total);
                         }
                     }
                     return localState;
                 },
-
                 localState =>
                 {
                     localState.matcher.Dispose();
@@ -324,96 +325,16 @@ namespace PictureSearch
                     localState.targetDesc.Dispose();
                 }
             );
+
             Cv2.SetNumThreads(-1);
 
             var pathIndexMap = collectionPaths
-                .Select((path, index) => (path, index))
-                .ToDictionary(x => x.path, x => x.index);
+                .Select((p, index) => (p, index))
+                .ToDictionary(x => x.p, x => x.index);
 
-            matchedFiles = matchedBag
-                .OrderBy(path => pathIndexMap[path])
-                .ToList();
+            matchedFiles = matchedBag.OrderBy(p => pathIndexMap[p]).ToList();
 
             return matchedFiles;
         }
-
-        // œŒ—À≤ƒŒ¬Õ»… ¿À√Œ–»“Ã ƒÀﬂ ≈ —œ≈–»Ã≈Õ“” (·ÂÁ ˜ËÚ‡ÌÌˇ Á ‰ËÒÍ‡)
-        public void SearchSequentialBenchmark(List<Mat> preloadedImages, Action<int, int> reportProgress)
-        {
-            int total = preloadedImages.Count;
-            var config = GetMatchConfig();
-
-            using var matcher = new BFMatcher(NormTypes.Hamming, crossCheck: false);
-            using var clahe = Cv2.CreateCLAHE(clipLimit: 2.0, tileGridSize: new OpenCvSharp.Size(8, 8));
-            using var orb = ORB.Create(8000, 1.2f, 8, 15, 0, 2, 0, 15, 7);
-
-            using var magnifiedTarget = new Mat();
-            using var enhancedTarget = new Mat();
-            using var targetDescriptor = new Mat();
-
-            for (int i = 0; i < total; i++)
-            {
-                Mat targetImg = preloadedImages[i]; // ¡ÂÂÏÓ ‚ÊÂ „ÓÚÓ‚Û Í‡ÚËÌÍÛ Á Ô‡Ï'ˇÚ≥
-                if (targetImg.Empty()) continue;
-
-                PreprocessImage(targetImg, magnifiedTarget, enhancedTarget, targetDescriptor, clahe, orb, out var targetKeypoints);
-
-                if (targetDescriptor.Rows < config.MinInliers) continue;
-
-                CheckIfMatchFound(targetDescriptor, targetKeypoints, matcher, config);
-
-                reportProgress?.Invoke(i + 1, total);
-            }
-        }
-
-        // œ¿–¿À≈À‹Õ»… ¿À√Œ–»“Ã ƒÀﬂ ≈ —œ≈–»Ã≈Õ“” (·ÂÁ ˜ËÚ‡ÌÌˇ Á ‰ËÒÍ‡)
-        public void SearchParallelBenchmark(List<Mat> preloadedImages, Action<int, int> reportProgress, int threadCount)
-        {
-            int total = preloadedImages.Count;
-            Cv2.SetNumThreads(1);
-            var config = GetMatchConfig();
-            int processedCount = 0;
-
-            int degreeOfParallelism = (threadCount > 0) ? threadCount : Environment.ProcessorCount;
-            int chunkSize = (total + degreeOfParallelism - 1) / degreeOfParallelism;
-
-            Parallel.ForEach(
-                Partitioner.Create(0, total, chunkSize),
-                new ParallelOptions { MaxDegreeOfParallelism = degreeOfParallelism },
-                () => new {
-                    matcher = new BFMatcher(NormTypes.Hamming, crossCheck: false),
-                    clahe = Cv2.CreateCLAHE(clipLimit: 2.0, tileGridSize: new OpenCvSharp.Size(8, 8)),
-                    orb = ORB.Create(8000, 1.2f, 8, 15, 0, 2, 0, 15, 7),
-                    magTarget = new Mat(),
-                    enhTarget = new Mat(),
-                    targetDesc = new Mat()
-                },
-                (range, loopState, localState) =>
-                {
-                    for (int i = range.Item1; i < range.Item2; i++)
-                    {
-                        Mat targetImg = preloadedImages[i]; // ¡ÂÂÏÓ ‚ÊÂ „ÓÚÓ‚Û Í‡ÚËÌÍÛ Á Ô‡Ï'ˇÚ≥
-                        if (targetImg.Empty()) continue;
-
-                        PreprocessImage(targetImg, localState.magTarget, localState.enhTarget, localState.targetDesc, localState.clahe, localState.orb, out var targetKeypoints);
-
-                        if (localState.targetDesc.Rows < config.MinInliers) continue;
-
-                        CheckIfMatchFound(localState.targetDesc, targetKeypoints, localState.matcher, config);
-
-                        int current = Interlocked.Increment(ref processedCount);
-                        if (current % 20 == 0 || current == total)
-                            reportProgress?.Invoke(current, total);
-                    }
-                    return localState;
-                },
-                localState => {
-                    localState.matcher.Dispose(); localState.clahe.Dispose(); localState.orb.Dispose();
-                    localState.magTarget.Dispose(); localState.enhTarget.Dispose(); localState.targetDesc.Dispose();
-                }
-            );
-            Cv2.SetNumThreads(-1);
-        }
-
     }
 }
